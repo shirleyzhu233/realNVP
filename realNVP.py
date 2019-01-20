@@ -958,6 +958,12 @@ def logit_transform(x, constraint=0.9, reverse=False):
         x /= 2.             # [0, 1]
         return x, 0
     else:
+        [B, C, H, W] = list(x.size())
+        
+        # dequantization
+        noise = distributions.Uniform(0, 1).sample((B*C*H*W, ))
+        x = (x * 255. + noise.reshape((B, C, H, W))) / 256.
+        
         # restrict the data
         x *= 2.             # [0, 2]
         x -= 1.             # [-1, 1]
