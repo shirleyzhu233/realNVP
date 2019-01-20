@@ -1023,8 +1023,7 @@ def main(args):
 
     image_size = 32
     full_dim = 3 * image_size**2
-    prior = distributions.Normal( # isotropic gaussian
-        torch.tensor([0.0]).to(device), torch.tensor([1.0]).to(device))
+    prior = distributions.Normal(0.0, 1.0)	# isotropic gaussian
     flow = RealNVP(prior=prior, 
                    base_dim=base_dim, 
                    res_blocks=res_blocks, 
