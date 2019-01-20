@@ -986,6 +986,7 @@ def main(args):
 
     # model hyperparameters
     batch_size = args.batch_size
+    latent = args.latent
     base_dim = args.base_dim
     res_blocks = args.res_blocks
     mask_config = args.mask_config
@@ -1023,7 +1024,15 @@ def main(args):
 
     image_size = 32
     full_dim = 3 * image_size**2
-    prior = distributions.Normal(0.0, 1.0)	# isotropic gaussian
+
+    if latent == 'normal':
+        prior = distributions.Normal(0., 1.)
+    elif latent == 'logistic':
+        base = distributions.Uniform(0., 1.)
+        transforms = [distributions.SigmoidTransform().inv, 
+                      distributions.AffineTransform(loc=0., scale=1.)]
+        prior = distributions.TransformedDistribution(base, transforms)
+
     flow = RealNVP(prior=prior, 
                    base_dim=base_dim, 
                    res_blocks=res_blocks, 
@@ -1125,6 +1134,10 @@ if __name__ == '__main__':
                         help='number of images in a mini-batch',
                         type=int,
                         default=64)
+    parser.add_argument('--latent',
+                        help='latent distribution',
+                        type=str,
+                        default='normal')
     parser.add_argument('--base_dim',
                         help='features in residual blocks of first few layers.',
                         type=int,
