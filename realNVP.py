@@ -906,7 +906,7 @@ class RealNVP(nn.Module):
         Args:
             x: input minibatch.
         Returns:
-            latent code and log-likelihood of input.
+            log-likelihood of input.
         """
         z, log_diag_J = self.f(x)
         [B, C, H, W] = list(z.size())
