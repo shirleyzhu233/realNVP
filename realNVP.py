@@ -233,6 +233,7 @@ class CheckerboardAdditiveCoupling(AbstractCoupling):
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
+            size: height/width of features.
             mask_config: mask configuration (see build_mask() for more detail).
             hps: the set of hyperparameters.
         """
@@ -291,6 +292,7 @@ class CheckerboardAffineCoupling(AbstractCoupling):
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
+            size: height/width of features.
             mask_config: mask configuration (see build_mask() for more detail).
             hps: the set of hyperparameters.
         """
@@ -354,6 +356,7 @@ class CheckerboardCoupling(nn.Module):
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
+            size: height/width of features.
             mask_config: mask configuration (see build_mask() for more detail).
             hps: the set of hyperparameters.
         """
@@ -617,6 +620,7 @@ class RealNVP(nn.Module):
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
+            size: height/width of features.
             hps: the set of hyperparameters.
             final: True if at final scale, False otherwise.
         Returns:
@@ -682,6 +686,14 @@ class RealNVP(nn.Module):
         return x
 
     def order_matrix(self, channel):
+        """Constructs a matrix that defines the ordering of variables
+        when downscaling/upscaling is performed.
+
+        Args:
+          channel: number of features.
+        Returns:
+          a kernel for rearrange the variables.
+        """
         weights = np.zeros((channel*4, channel, 2, 2))
         ordering = np.array([[[[1., 0.],
                                [0., 0.]]],
@@ -709,6 +721,7 @@ class RealNVP(nn.Module):
 
         Args:
             x: input tensor (B x C x H x W).
+            order_matrix: a kernel that defines the ordering of variables.
         Returns:
             the top half for further transformation (B x 2C x H/2 x W/2)
             and the Gaussianized bottom half (B x 2C x H/2 x W/2).
@@ -726,6 +739,7 @@ class RealNVP(nn.Module):
         Args:
             on: the active (transformed) variables (B x C x H x W).
             off: the inactive variables (B x C x H x W).
+            order_matrix: a kernel that defines the ordering of variables.
         Returns:
             combined variables (B x 2C x H x W).
         """
@@ -805,7 +819,7 @@ class RealNVP(nn.Module):
         Args:
             x: tensor in data space X.
         Returns:
-            transformed tensor in latent space Z.
+            transformed tensor and log of diagonal elements of Jacobian.
         """
         z, log_diag_J = x, torch.zeros_like(x)
 
@@ -919,7 +933,8 @@ class RealNVP(nn.Module):
         Args:
             x: input minibatch.
         Returns:
-            log-likelihood of input.
+            log-likelihood of input and sum of squares of scaling factors.
+            (the latter is used in L2 regularization.)
         """
         weight_scale = None
         for name, param in self.named_parameters():
@@ -947,7 +962,7 @@ class DataInfo():
 class Hyperparameters():
     def __init__(self, base_dim, res_blocks, bottleneck, 
         skip, weight_norm, coupling_bn, affine):
-        """Instantiates a set of hyperparameters.
+        """Instantiates a set of hyperparameters used for constructing layers.
 
         Args:
             base_dim: features in residual blocks of first few layers.
