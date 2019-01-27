@@ -2,15 +2,14 @@ import argparse
 
 import torch
 import torch.nn as nn
-import torch.nn.utils.weight_norm as add_weight_norm
 import torch.distributions as distributions
 import torch.nn.functional as F
 import torch.optim as optim
 
 import torchvision
 import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 import torchvision.utils as utils
-import matplotlib.pyplot as plt
 import numpy as np
 
 class WeightNormConv2d(nn.Module):
@@ -33,7 +32,7 @@ class WeightNormConv2d(nn.Module):
         super(WeightNormConv2d, self).__init__()
 
         if weight_norm:
-            self.conv = add_weight_norm(
+            self.conv = nn.utils.weight_norm(
                 nn.Conv2d(in_dim, out_dim, kernel_size, 
                     stride=stride, padding=padding, bias=bias))
             if not scale:
@@ -54,13 +53,12 @@ class WeightNormConv2d(nn.Module):
         return self.conv(x)
 
 class ResidualBlock(nn.Module):
-    def __init__(self, dim, bottleneck, down_factor, weight_norm):
+    def __init__(self, dim, bottleneck, weight_norm):
         """Initializes a ResidualBlock.
 
         Args:
-            dim: number of input features.
+            dim: number of input and output features.
             bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
             weight_norm: True if apply weight normalization, False otherwise.
         """
         super(ResidualBlock, self).__init__()
@@ -69,17 +67,16 @@ class ResidualBlock(nn.Module):
             nn.BatchNorm2d(dim),
             nn.ReLU())
         if bottleneck:
-            mid_dim = dim // down_factor
             self.res_block = nn.Sequential(
-                WeightNormConv2d(dim, mid_dim, (1, 1), stride=1, padding=0, 
+                WeightNormConv2d(dim, dim, (1, 1), stride=1, padding=0, 
                     bias=False, weight_norm=weight_norm, scale=False),
-                nn.BatchNorm2d(mid_dim),
+                nn.BatchNorm2d(dim),
                 nn.ReLU(),
-                WeightNormConv2d(mid_dim, mid_dim, (3, 3), stride=1, padding=1, 
+                WeightNormConv2d(dim, dim, (3, 3), stride=1, padding=1, 
                     bias=False, weight_norm=weight_norm, scale=False),
-                nn.BatchNorm2d(mid_dim),
+                nn.BatchNorm2d(dim),
                 nn.ReLU(),
-                WeightNormConv2d(mid_dim, dim, (1, 1), stride=1, padding=0, 
+                WeightNormConv2d(dim, dim, (1, 1), stride=1, padding=0, 
                     bias=True, weight_norm=weight_norm, scale=True))
         else:
             self.res_block = nn.Sequential(
@@ -102,7 +99,7 @@ class ResidualBlock(nn.Module):
 
 class ResidualModule(nn.Module):
     def __init__(self, in_dim, dim, out_dim, 
-        res_blocks, bottleneck, down_factor, skip, weight_norm):
+        res_blocks, bottleneck, skip, weight_norm):
         """Initializes a ResidualModule.
 
         Args:
@@ -111,7 +108,6 @@ class ResidualModule(nn.Module):
             out_dim: number of output features.
             res_blocks: number of residual blocks to use.
             bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
             skip: True if use skip architecture, False otherwise.
             weight_norm: True if apply weight normalization, False otherwise.
         """
@@ -123,7 +119,7 @@ class ResidualModule(nn.Module):
             self.in_block = WeightNormConv2d(in_dim, dim, (3, 3), stride=1, 
                 padding=1, bias=True, weight_norm=weight_norm, scale=False)
             self.core_block = nn.ModuleList(
-                [ResidualBlock(dim, bottleneck, down_factor, weight_norm) 
+                [ResidualBlock(dim, bottleneck, weight_norm) 
                 for _ in range(res_blocks)])
             self.out_block = nn.Sequential(
                 nn.BatchNorm2d(dim),
@@ -184,36 +180,38 @@ class ResidualModule(nn.Module):
             return self.block(x)
 
 class AbstractCoupling(nn.Module):
-    def __init__(self, mask_config, coupling_bn):
+    def __init__(self, mask_config, hps):
         """Initializes an AbstractCoupling.
 
         Args:
             mask_config: mask configuration (see build_mask() for more detail).
+            hps: the set of hyperparameters.
         """
         super(AbstractCoupling, self).__init__()
         self.mask_config = mask_config
-        self.coupling_bn = coupling_bn
+        self.res_blocks = hps.res_blocks
+        self.bottleneck = hps.bottleneck
+        self.skip = hps.skip
+        self.weight_norm = hps.weight_norm
+        self.coupling_bn = hps.coupling_bn
 
-    def build_mask(self, B, H, W, config=1.):
+    def build_mask(self, size, config=1.):
         """Builds a binary checkerboard mask.
 
-        (Only for constructing masks for checkboard coupling layers.)
+        (Only for constructing masks for checkerboard coupling layers.)
 
         Args:
-            B: batch size.
-            H: height of feature map.
-            W: width of feature map.
-            config:    mask configuration that determines which pixels to mask up.
+            size: height/width of features.
+            config: mask configuration that determines which pixels to mask up.
                     if 1:        if 0:
-                        1 0            0 1
+                        1 0         0 1
                         0 1         1 0
         Returns:
             a binary mask (1: pixel on, 0: pixel off).
         """
-        mask = np.arange(H).reshape((-1, 1)) + np.arange(W)
+        mask = np.arange(size).reshape(-1, 1) + np.arange(size)
         mask = np.mod(config + mask, 2)
-        mask = np.reshape(mask, [-1, 1, H, W])
-        mask = np.tile(mask, [B, 1, 1, 1])
+        mask = mask.reshape(-1, 1, size, size)
         return torch.tensor(mask.astype('float32'))
 
     def batch_stat(self, x):
@@ -229,30 +227,23 @@ class AbstractCoupling(nn.Module):
         return mean, var
 
 class CheckerboardAdditiveCoupling(AbstractCoupling):
-    def __init__(self, in_out_dim, mid_dim, res_blocks, mask_config, 
-        bottleneck, down_factor, skip, weight_norm, coupling_bn):
+    def __init__(self, in_out_dim, mid_dim, size, mask_config, hps):
         """Initializes a CheckerboardAdditiveCoupling.
 
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
-            res_blocks: number of residual blocks to use.
             mask_config: mask configuration (see build_mask() for more detail).
-            bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
-            skip: True if use skip architecture, False otherwise.
-            weight_norm: True if apply weight normalization, False otherwise.
-            coupling_bn: True if apply batch normalization on output of 
-                coupling layer, False otherwise.
+            hps: the set of hyperparameters.
         """
-        super(CheckerboardAdditiveCoupling, self).__init__(
-            mask_config, coupling_bn)
+        super(CheckerboardAdditiveCoupling, self).__init__(mask_config, hps)
         
+        self.mask = self.build_mask(size, config=mask_config).cuda()
         self.in_bn = nn.BatchNorm2d(in_out_dim)
         self.block = nn.Sequential(
             nn.ReLU(),
-            ResidualModule(2*in_out_dim+1, mid_dim, in_out_dim, res_blocks, 
-                bottleneck, down_factor, skip, weight_norm))
+            ResidualModule(2*in_out_dim+1, mid_dim, in_out_dim, 
+                self.res_blocks, self.bottleneck, self.skip, self.weight_norm))
         self.out_bn = nn.BatchNorm2d(in_out_dim, affine=False)
 
     def forward(self, x, reverse=False):
@@ -264,8 +255,8 @@ class CheckerboardAdditiveCoupling(AbstractCoupling):
         Returns:
             transformed tensor and log of diagonal elements of Jacobian.
         """
-        [B, _, H, W] = list(x.size())
-        mask = self.build_mask(B, H, W, config=self.mask_config).cuda()
+        [B, _, _, _] = list(x,size())
+        mask = self.mask.repeat(B, 1, 1, 1)
         x_ = self.in_bn(x * mask)
         x_ = torch.cat((x_, -x_), dim=1)
         x_ = torch.cat((x_, mask), dim=1)     # 2C+1 channels
@@ -276,8 +267,8 @@ class CheckerboardAdditiveCoupling(AbstractCoupling):
         if reverse:
             if self.coupling_bn:
                 mean, var = self.out_bn.running_mean, self.out_bn.running_var
-                mean = mean.reshape((-1, 1, 1, 1)).transpose(0, 1)
-                var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                mean = mean.reshape(-1, 1, 1, 1).transpose(0, 1)
+                var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 x = x * torch.exp(0.5 * torch.log(var + 1e-5) * (1. - mask)) \
                     + mean * (1. - mask)
             x = x - shift
@@ -288,38 +279,31 @@ class CheckerboardAdditiveCoupling(AbstractCoupling):
                     _, var = self.batch_stat(x)
                 else:
                     var = self.out_bn.running_var
-                    var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                    var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 x = self.out_bn(x) * (1. - mask) + x * mask
                 log_diag_J = log_diag_J - 0.5 * torch.log(var + 1e-5) * (1. - mask)
         return x, log_diag_J
 
 class CheckerboardAffineCoupling(AbstractCoupling):
-    def __init__(self, in_out_dim, mid_dim, res_blocks, mask_config, 
-        bottleneck, down_factor, skip, weight_norm, coupling_bn):
+    def __init__(self, in_out_dim, mid_dim, size, mask_config, hps):
         """Initializes a CheckerboardAffineCoupling.
 
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
-            res_blocks: number of residual blocks to use.
             mask_config: mask configuration (see build_mask() for more detail).
-            bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
-            skip: True if use skip architecture, False otherwise.
-            weight_norm: True if apply weight normalization, False otherwise.
-            coupling_bn: True if apply batch normalization on output of 
-                coupling layer, False otherwise.
+            hps: the set of hyperparameters.
         """
-        super(CheckerboardAffineCoupling, self).__init__(
-            mask_config, coupling_bn)
+        super(CheckerboardAffineCoupling, self).__init__(mask_config, hps)
 
+        self.mask = self.build_mask(size, config=mask_config).cuda()
         self.scale = nn.Parameter(torch.zeros(1), requires_grad=True)
         self.scale_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
         self.in_bn = nn.BatchNorm2d(in_out_dim)
         self.block = nn.Sequential(        # 1st half of resnet: shift
             nn.ReLU(),                    # 2nd half of resnet: log_rescale
-            ResidualModule(2*in_out_dim+1, mid_dim, 2*in_out_dim, res_blocks, 
-                bottleneck, down_factor, skip, weight_norm))
+            ResidualModule(2*in_out_dim+1, mid_dim, 2*in_out_dim, 
+                self.res_blocks, self.bottleneck, self.skip, self.weight_norm))
         self.out_bn = nn.BatchNorm2d(in_out_dim, affine=False)
 
     def forward(self, x, reverse=False):
@@ -331,8 +315,8 @@ class CheckerboardAffineCoupling(AbstractCoupling):
         Returns:
             transformed tensor and log of diagonal elements of Jacobian.
         """
-        [B, C, H, W] = list(x.size())
-        mask = self.build_mask(B, H, W, config=self.mask_config).cuda()
+        [B, C, _, _] = list(x.size())
+        mask = self.mask.repeat(B, 1, 1, 1)
         x_ = self.in_bn(x * mask)
         x_ = torch.cat((x_, -x_), dim=1)
         x_ = torch.cat((x_, mask), dim=1)    # 2C+1 channels
@@ -346,8 +330,8 @@ class CheckerboardAffineCoupling(AbstractCoupling):
         if reverse:
             if self.coupling_bn:
                 mean, var = self.out_bn.running_mean, self.out_bn.running_var
-                mean = mean.reshape((-1, 1, 1, 1)).transpose(0, 1)
-                var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                mean = mean.reshape(-1, 1, 1, 1).transpose(0, 1)
+                var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 x = x * torch.exp(0.5 * torch.log(var + 1e-5) * (1. - mask)) \
                     + mean * (1. - mask)
             x = (x - shift) * torch.exp(-log_rescale)
@@ -358,39 +342,29 @@ class CheckerboardAffineCoupling(AbstractCoupling):
                     _, var = self.batch_stat(x)
                 else:
                     var = self.out_bn.running_var
-                    var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                    var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 x = self.out_bn(x) * (1. - mask) + x * mask
                 log_diag_J = log_diag_J - 0.5 * torch.log(var + 1e-5) * (1. - mask)
         return x, log_diag_J
 
 class CheckerboardCoupling(nn.Module):
-    def __init__(self, in_out_dim, mid_dim, res_blocks, mask_config, 
-        bottleneck, down_factor, skip, weight_norm, coupling_bn, affine):
+    def __init__(self, in_out_dim, mid_dim, size, mask_config, hps):
         """Initializes a CheckerboardCoupling.
 
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
-            res_blocks: number of residual blocks to use.
             mask_config: mask configuration (see build_mask() for more detail).
-            bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
-            skip: True if use skip architecture, False otherwise.
-            weight_norm: True if apply weight normalization, False otherwise.
-            coupling_bn: True if apply batch normalization on output of 
-                coupling layer, False otherwise.
-            affine: True if use affine map, False if use additive map.
+            hps: the set of hyperparameters.
         """
         super(CheckerboardCoupling, self).__init__()
 
-        if affine:
+        if hps.affine:
             self.coupling = CheckerboardAffineCoupling(
-                in_out_dim, mid_dim, res_blocks, mask_config, 
-                bottleneck, down_factor, skip, weight_norm, coupling_bn)
+                in_out_dim, mid_dim, size, mask_config, hps)
         else:
             self.coupling = CheckerboardAdditiveCoupling(
-                in_out_dim, mid_dim, res_blocks, mask_config, 
-                bottleneck, down_factor, skip, weight_norm, coupling_bn)
+                in_out_dim, mid_dim, size, mask_config, hps)
 
     def forward(self, x, reverse=False):
         """Forward pass.
@@ -404,30 +378,22 @@ class CheckerboardCoupling(nn.Module):
         return self.coupling(x, reverse)
 
 class ChannelwiseAdditiveCoupling(AbstractCoupling):
-    def __init__(self, in_out_dim, mid_dim, res_blocks, mask_config, 
-        bottleneck, down_factor, skip, weight_norm, coupling_bn):
+    def __init__(self, in_out_dim, mid_dim, mask_config, hps):
         """Initializes a ChannelwiseAdditiveCoupling.
 
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
-            res_blocks: number of residual blocks to use.
             mask_config: 1 if change the top half, 0 if change the bottom half.
-            bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
-            skip: True if use skip architecture, False otherwise.
-            weight_norm: True if apply weight normalization, False otherwise.
-            coupling_bn: True if apply batch normalization on output of 
-                coupling layer, False otherwise.
+            hps: the set of hyperparameters.
         """
-        super(ChannelwiseAdditiveCoupling, self).__init__(
-            mask_config, coupling_bn)
+        super(ChannelwiseAdditiveCoupling, self).__init__(mask_config, hps)
 
         self.in_bn = nn.BatchNorm2d(in_out_dim//2)
         self.block = nn.Sequential(
             nn.ReLU(),
-            ResidualModule(in_out_dim, mid_dim, in_out_dim//2, res_blocks, 
-                bottleneck, down_factor, skip, weight_norm))
+            ResidualModule(in_out_dim, mid_dim, in_out_dim//2, 
+                self.res_blocks, self.bottleneck, self.skip, self.weight_norm))
         self.out_bn = nn.BatchNorm2d(in_out_dim//2, affine=False)
 
     def forward(self, x, reverse=False):
@@ -453,8 +419,8 @@ class ChannelwiseAdditiveCoupling(AbstractCoupling):
         if reverse:
             if self.coupling_bn:
                 mean, var = self.out_bn.running_mean, self.out_bn.running_var
-                mean = mean.reshape((-1, 1, 1, 1)).transpose(0, 1)
-                var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                mean = mean.reshape(-1, 1, 1, 1).transpose(0, 1)
+                var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 on = on * torch.exp(0.5 * torch.log(var + 1e-5)) + mean
             on = on - shift
         else:
@@ -464,7 +430,7 @@ class ChannelwiseAdditiveCoupling(AbstractCoupling):
                     _, var = self.batch_stat(on)
                 else:
                     var = self.out_bn.running_var
-                    var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                    var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 on = self.out_bn(on)
                 log_diag_J = log_diag_J - 0.5 * torch.log(var + 1e-5)
         if self.mask_config:
@@ -474,32 +440,24 @@ class ChannelwiseAdditiveCoupling(AbstractCoupling):
         return x, log_diag_J
 
 class ChannelwiseAffineCoupling(AbstractCoupling):
-    def __init__(self, in_out_dim, mid_dim, res_blocks, mask_config, 
-        bottleneck, down_factor, skip, weight_norm, coupling_bn):
+    def __init__(self, in_out_dim, mid_dim, mask_config, hps):
         """Initializes a ChannelwiseAffineCoupling.
 
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
-            res_blocks: number of residual blocks to use.
             mask_config: 1 if change the top half, 0 if change the bottom half.
-            bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
-            skip: True if use skip architecture, False otherwise.
-            weight_norm: True if apply weight normalization, False otherwise.
-            coupling_bn: True if apply batch normalization on output of 
-                coupling layer, False otherwise.
+            hps: the set of hyperparameters.
         """
-        super(ChannelwiseAffineCoupling, self).__init__(
-            mask_config, coupling_bn)
+        super(ChannelwiseAffineCoupling, self).__init__(mask_config, hps)
 
         self.scale = nn.Parameter(torch.zeros(1), requires_grad=True)
         self.scale_shift = nn.Parameter(torch.zeros(1), requires_grad=True)
         self.in_bn = nn.BatchNorm2d(in_out_dim//2)
         self.block = nn.Sequential(        # 1st half of resnet: shift
             nn.ReLU(),                    # 2nd half of resnet: log_rescale
-            ResidualModule(in_out_dim, mid_dim, in_out_dim, res_blocks, 
-                bottleneck, down_factor, skip, weight_norm))
+            ResidualModule(in_out_dim, mid_dim, in_out_dim, 
+                self.res_blocks, self.bottleneck, self.skip, self.weight_norm))
         self.out_bn = nn.BatchNorm2d(in_out_dim//2, affine=False)
 
     def forward(self, x, reverse=False):
@@ -527,8 +485,8 @@ class ChannelwiseAffineCoupling(AbstractCoupling):
         if reverse:
             if self.coupling_bn:
                 mean, var = self.out_bn.running_mean, self.out_bn.running_var
-                mean = mean.reshape((-1, 1, 1, 1)).transpose(0, 1)
-                var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                mean = mean.reshape(-1, 1, 1, 1).transpose(0, 1)
+                var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 on = on * torch.exp(0.5 * torch.log(var + 1e-5)) + mean
             on = (on - shift) * torch.exp(-log_rescale)
         else:
@@ -538,7 +496,7 @@ class ChannelwiseAffineCoupling(AbstractCoupling):
                     _, var = self.batch_stat(on)
                 else:
                     var = self.out_bn.running_var
-                    var = var.reshape((-1, 1, 1, 1)).transpose(0, 1)
+                    var = var.reshape(-1, 1, 1, 1).transpose(0, 1)
                 on = self.out_bn(on)
                 log_diag_J = log_diag_J - 0.5 * torch.log(var + 1e-5)
         if self.mask_config:
@@ -552,33 +510,23 @@ class ChannelwiseAffineCoupling(AbstractCoupling):
         return x, log_diag_J
 
 class ChannelwiseCoupling(nn.Module):
-    def __init__(self, in_out_dim, mid_dim, res_blocks, mask_config, 
-        bottleneck, down_factor, skip, weight_norm, coupling_bn, affine):
+    def __init__(self, in_out_dim, mid_dim, mask_config, hps):
         """Initializes a ChannelwiseCoupling.
 
         Args:
             in_out_dim: number of input and output features.
             mid_dim: number of features in residual blocks.
-            res_blocks: number of residual blocks to use.
             mask_config: 1 if change the top half, 0 if change the bottom half.
-            bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
-            skip: True if use skip architecture, False otherwise.
-            weight_norm: True if apply weight normalization, False otherwise.
-            coupling_bn: True if apply batch normalization on output of 
-                coupling layer, False otherwise.
-            affine: True if use affine map, False if use additive map.
+            hps: the set of hyperparameters.
         """
         super(ChannelwiseCoupling, self).__init__()
 
-        if affine:
+        if hps.affine:
             self.coupling = ChannelwiseAffineCoupling(
-                in_out_dim, mid_dim, res_blocks, mask_config, 
-                bottleneck, down_factor, skip, weight_norm, coupling_bn)
+                in_out_dim, mid_dim, mask_config, hps)
         else:
             self.coupling = ChannelwiseAdditiveCoupling(
-                in_out_dim, mid_dim, res_blocks, mask_config, 
-                bottleneck, down_factor, skip, weight_norm, coupling_bn)
+                in_out_dim, mid_dim, mask_config, hps)
 
     def forward(self, x, reverse=False):
         """Forward pass.
@@ -592,126 +540,114 @@ class ChannelwiseCoupling(nn.Module):
         return self.coupling(x, reverse)
 
 class RealNVP(nn.Module):
-    def __init__(self, prior, base_dim=64, res_blocks=8, mask_config=1., 
-        bottleneck=False, down_factor=1, skip=False, 
-        weight_norm=True, coupling_bn=True, affine=False):
+    def __init__(self, datainfo, prior, hps):
         """Initializes a RealNVP.
 
         Args:
+            datainfo: information of dataset to be modeled.
             prior: prior distribution over latent space Z.
-            base_dim: feature numbers in residual blocks of first few layers.
-            res_blocks: number of residual blocks to use in coupling layers.
-            mask_config: mask configuration.
-            bottleneck: True if use bottleneck, False otherwise.
-            down_factor: by how much to reduce feature numbers in bottleneck.
-            skip: True if use skip architecture, False otherwise.
-            weight_norm: True if apply weight normalization, False otherwise.
-            coupling_bn: True if apply batch normalization on output of 
-                coupling layer, False otherwise.
-            affine: True if use affine map, False if use additive map.
+            hps: the set of hyperparameters.
         """
         super(RealNVP, self).__init__()
+        self.datainfo = datainfo
         self.prior = prior
-        dim = base_dim
+        self.hps = hps
 
-        # multi-scale architecture for CIFAR-10 (down to 16 x 16 x C)
-        # SCALE 1: 32 x 32
-        self.scale_1_ckbd = nn.ModuleList([    # in/out (C x H x W): 3 x 32 x 32
-            CheckerboardCoupling(in_out_dim=3, mid_dim=dim, 
-                                 res_blocks=res_blocks, 
-                                 mask_config=mask_config, 
-                                 bottleneck=bottleneck, 
-                                 down_factor=down_factor, 
-                                 skip=skip, 
-                                 weight_norm=weight_norm, 
-                                 coupling_bn=coupling_bn, 
-                                 affine=affine),
-            CheckerboardCoupling(in_out_dim=3, mid_dim=dim, 
-                                 res_blocks=res_blocks, 
-                                 mask_config=1.-mask_config, 
-                                 bottleneck=bottleneck, 
-                                 down_factor=down_factor, 
-                                 skip=skip, 
-                                 weight_norm=weight_norm, 
-                                 coupling_bn=coupling_bn, 
-                                 affine=affine),
-            CheckerboardCoupling(in_out_dim=3, mid_dim=dim, 
-                                 res_blocks=res_blocks, 
-                                 mask_config=mask_config, 
-                                 bottleneck=bottleneck, 
-                                 down_factor=down_factor, 
-                                 skip=skip, 
-                                 weight_norm=weight_norm, 
-                                 coupling_bn=coupling_bn, 
-                                 affine=affine)])
+        chan = datainfo.channel
+        size = datainfo.size
+        dim = hps.base_dim
+
+        if datainfo.name == 'cifar10':
+            # architecture for CIFAR-10 (down to 16 x 16 x C)
+            # SCALE 1: 3 x 32 x 32
+            self.s1_ckbd = self.checkerboard_combo(chan, dim, size, hps)
+            self.s1_chan = self.channelwise_combo(chan*4, dim, hps)
+            self.order_matrix_1 = self.order_matrix(chan).cuda()
+            chan *= 2
+            size //= 2
+
+            # SCALE 2: 6 x 16 x 16
+            self.s2_ckbd = self.checkerboard_combo(chan, dim, size, hps, final=True)
+
+        else: # NOTE: can construct with loop (for future edit)
+            # architecture for ImageNet and CelebA (down to 4 x 4 x C)
+            # SCALE 1: 3 x 32(64) x 32(64)
+            self.s1_ckbd = self.checkerboard_combo(chan, dim, size, hps)
+            self.s1_chan = self.channelwise_combo(chan*4, dim*2, hps)
+            self.order_matrix_1 = self.order_matrix(chan).cuda()
+            chan *= 2
+            size //= 2
+            dim *= 2
+
+            # SCALE 2: 6 x 16(32) x 16(32)
+            self.s2_ckbd = self.checkerboard_combo(chan, dim, size, hps)
+            self.s2_chan = self.channelwise_combo(chan*4, dim*2, hps)
+            self.order_matrix_2 = self.order_matrix(chan).cuda()
+            chan *= 2
+            size //= 2
+            dim *= 2
+
+            # SCALE 3: 12 x 8(16) x 8(16)
+            self.s3_ckbd = self.checkerboard_combo(chan, dim, size, hps)
+            self.s3_chan = self.channelwise_combo(chan*4, dim*2, hps)
+            self.order_matrix_3 = self.order_matrix(chan).cuda()
+            chan *= 2
+            size //= 2
+            dim *= 2
+
+            if datainfo.name == 'imnet32':
+                # SCALE 4: 24 x 4 x 4
+                self.s4_ckbd = self.checkerboard_combo(chan, dim, size, hps, final=True)
+            
+            elif datainfo.name in ['imnet64', 'celeba']:
+                # SCALE 4: 24 x 8 x 8
+                self.s4_ckbd = self.checkerboard_combo(chan, dim, size, hps)
+                self.s4_chan = self.channelwise_combo(chan*4, dim*2, hps)
+                self.order_matrix_4 = self.order_matrix(chan).cuda()
+                chan *= 2
+                size //= 2
+                dim *= 2
+
+                # SCALE 5: 48 x 4 x 4
+                self.s5_ckbd = self.checkerboard_combo(chan, dim, size, hps, final=True)
+
+    def checkerboard_combo(self, in_out_dim, mid_dim, size, hps, final=False):
+        """Construct a combination of checkerboard coupling layers.
+
+        Args:
+            in_out_dim: number of input and output features.
+            mid_dim: number of features in residual blocks.
+            hps: the set of hyperparameters.
+            final: True if at final scale, False otherwise.
+        Returns:
+            A combination of checkerboard coupling layers.
+        """
+        if final:
+            return nn.ModuleList([
+                CheckerboardCoupling(in_out_dim, mid_dim, size, 1., hps),
+                CheckerboardCoupling(in_out_dim, mid_dim, size, 0., hps),
+                CheckerboardCoupling(in_out_dim, mid_dim, size, 1., hps),
+                CheckerboardCoupling(in_out_dim, mid_dim, size, 0., hps)])
+        else:
+            return nn.ModuleList([
+                CheckerboardCoupling(in_out_dim, mid_dim, size, 1., hps), 
+                CheckerboardCoupling(in_out_dim, mid_dim, size, 0., hps),
+                CheckerboardCoupling(in_out_dim, mid_dim, size, 1., hps)])
         
-        self.scale_1_chan = nn.ModuleList([    # in/out (C x H x W): 12 x 16 x 16
-            ChannelwiseCoupling(in_out_dim=12, mid_dim=dim, 
-                                res_blocks=res_blocks, 
-                                mask_config=1.-mask_config, 
-                                bottleneck=bottleneck, 
-                                down_factor=down_factor, 
-                                skip=skip, 
-                                weight_norm=weight_norm, 
-                                coupling_bn=coupling_bn, 
-                                affine=affine),
-            ChannelwiseCoupling(in_out_dim=12, mid_dim=dim, 
-                                res_blocks=res_blocks, 
-                                mask_config=mask_config, 
-                                bottleneck=bottleneck, 
-                                down_factor=down_factor, 
-                                skip=skip, 
-                                weight_norm=weight_norm, 
-                                coupling_bn=coupling_bn, 
-                                affine=affine),
-            ChannelwiseCoupling(in_out_dim=12, mid_dim=dim, 
-                                res_blocks=res_blocks, 
-                                mask_config=1.-mask_config, 
-                                bottleneck=bottleneck, 
-                                down_factor=down_factor, 
-                                skip=skip, 
-                                weight_norm=weight_norm, 
-                                coupling_bn=coupling_bn, 
-                                affine=affine)])
+    def channelwise_combo(self, in_out_dim, mid_dim, hps):
+        """Construct a combination of channelwise coupling layers.
 
-        # SCALE 2: 16 x 16
-        self.scale_2_ckbd = nn.ModuleList([    # in/out (C x H x W): 6 x 16 x 16
-            CheckerboardCoupling(in_out_dim=6, mid_dim=dim, 
-                                 res_blocks=res_blocks, 
-                                 mask_config=mask_config, 
-                                 bottleneck=bottleneck, 
-                                 down_factor=down_factor, 
-                                 skip=skip, 
-                                 weight_norm=weight_norm,
-                                 coupling_bn=coupling_bn, 
-                                 affine=affine),
-            CheckerboardCoupling(in_out_dim=6, mid_dim=dim, 
-                                 res_blocks=res_blocks, 
-                                 mask_config=1.-mask_config, 
-                                 bottleneck=bottleneck, 
-                                 down_factor=down_factor, 
-                                 skip=skip, 
-                                 weight_norm=weight_norm, 
-                                 coupling_bn=coupling_bn, 
-                                 affine=affine),
-            CheckerboardCoupling(in_out_dim=6, mid_dim=dim, 
-                                 res_blocks=res_blocks, 
-                                 mask_config=mask_config, 
-                                 bottleneck=bottleneck, 
-                                 down_factor=down_factor, 
-                                 skip=skip, 
-                                 weight_norm=weight_norm, 
-                                 coupling_bn=coupling_bn, 
-                                 affine=affine),
-            CheckerboardCoupling(in_out_dim=6, mid_dim=dim, 
-                                 res_blocks=res_blocks, 
-                                 mask_config=1.-mask_config, 
-                                 bottleneck=bottleneck, 
-                                 down_factor=down_factor, 
-                                 skip=skip, 
-                                 weight_norm=weight_norm, 
-                                 coupling_bn=coupling_bn, 
-                                 affine=affine)])
+        Args:
+            in_out_dim: number of input and output features.
+            mid_dim: number of features in residual blocks.
+            hps: the set of hyperparameters.
+        Returns:
+            A combination of channelwise coupling layers.
+        """
+        return nn.ModuleList([
+                ChannelwiseCoupling(in_out_dim, mid_dim, 0., hps),
+                ChannelwiseCoupling(in_out_dim, mid_dim, 1., hps),
+                ChannelwiseCoupling(in_out_dim, mid_dim, 0., hps)])
 
     def squeeze(self, x):
         """Squeezes a C x H x W tensor into a 4C x H/2 x W/2 tensor.
@@ -724,9 +660,9 @@ class RealNVP(nn.Module):
             the squeezed tensor (B x 4C x H/2 x W/2).
         """
         [B, C, H, W] = list(x.size())
-        x = x.reshape((B, C, H//2, 2, W//2, 2))
+        x = x.reshape(B, C, H//2, 2, W//2, 2)
         x = x.permute(0, 1, 3, 5, 2, 4)
-        x = x.reshape((B, C*4, H//2, W//2))
+        x = x.reshape(B, C*4, H//2, W//2)
         return x
 
     def undo_squeeze(self, x):
@@ -740,21 +676,13 @@ class RealNVP(nn.Module):
             the squeezed tensor (B x C/4 x 2H x 2W).
         """
         [B, C, H, W] = list(x.size())
-        x = x.reshape((B, C//4, 2, 2, H, W))
+        x = x.reshape(B, C//4, 2, 2, H, W)
         x = x.permute(0, 1, 4, 2, 5, 3)
-        x = x.reshape((B, C//4, H*2, W*2))
+        x = x.reshape(B, C//4, H*2, W*2)
         return x
 
-    def _downscale(self, x):
-        """Mixes up the variables and downscales the tensor.
-
-        Args:
-            x: input tensor (B x C x H x W).
-        Returns:
-            downscaled tensor (B x 4C x H/2 x W/2).
-        """
-        [_, C, _, _] = list(x.size())
-        weights = np.zeros((C*4, C, 2, 2))
+    def order_matrix(self, channel):
+        weights = np.zeros((channel*4, channel, 2, 2))
         ordering = np.array([[[[1., 0.],
                                [0., 0.]]],
                              [[[0., 0.],
@@ -763,49 +691,18 @@ class RealNVP(nn.Module):
                                [0., 0.]]],
                              [[[0., 0.],
                                [1., 0.]]]])
-        for i in range(C):
+        for i in range(channel):
             s1 = slice(i, i+1)
             s2 = slice(4*i, 4*(i+1))
             weights[s2, s1, :, :] = ordering
-        shuffle = np.array([4*i for i in range(C)]
-                         + [4*i+1 for i in range(C)]
-                         + [4*i+2 for i in range(C)]
-                         + [4*i+3 for i in range(C)])
+        shuffle = np.array([4*i for i in range(channel)]
+                         + [4*i+1 for i in range(channel)]
+                         + [4*i+2 for i in range(channel)]
+                         + [4*i+3 for i in range(channel)])
         weights = weights[shuffle, :, :, :].astype('float32')
-        weights = torch.tensor(weights).cuda()
-        return F.conv2d(x, weights, stride=2, padding=0)
+        return torch.tensor(weights)
 
-    def _upscale(self, x):
-        """Restores the order of variables and upscales the tensor.
-
-        Args:
-            x: input tensor (B x C x H x W).
-        Returns:
-            upscaled tensor (B x C/4 x 2H x 2W).
-        """
-        [_, C, _, _] = list(x.size())
-        weights = np.zeros((C, C//4, 2, 2))
-        ordering = np.array([[[[1., 0.],
-                               [0., 0.]]],
-                             [[[0., 0.],
-                               [0., 1.]]],
-                             [[[0., 1.],
-                               [0., 0.]]],
-                             [[[0., 0.],
-                               [1., 0.]]]])
-        for i in range(C//4):
-            s1 = slice(i, i+1)
-            s2 = slice(4*i, 4*(i+1))
-            weights[s2, s1, :, :] = ordering
-        shuffle = np.array([4*i for i in range(C//4)]
-                         + [4*i+1 for i in range(C//4)]
-                         + [4*i+2 for i in range(C//4)]
-                         + [4*i+3 for i in range(C//4)])
-        weights = weights[shuffle, :, :, :].astype('float32')
-        weights = torch.tensor(weights).cuda()
-        return F.conv_transpose2d(x, weights, stride=2, padding=0)
-
-    def factor_out(self, x):
+    def factor_out(self, x, order_matrix):
         """Downscales and factors out the bottom half of the tensor.
 
         (See Fig 4(b) in the real NVP paper.)
@@ -816,12 +713,12 @@ class RealNVP(nn.Module):
             the top half for further transformation (B x 2C x H/2 x W/2)
             and the Gaussianized bottom half (B x 2C x H/2 x W/2).
         """
-        x = self._downscale(x)
+        x = F.conv2d(x, order_matrix, stride=2, padding=0)
         [_, C, _, _] = list(x.size())
         (on, off) = x.split(C//2, dim=1)
         return on, off
 
-    def restore(self, on, off):
+    def restore(self, on, off, order_matrix):
         """Merges variables and restores their ordering.
 
         (See Fig 4(b) in the real NVP paper.)
@@ -833,7 +730,7 @@ class RealNVP(nn.Module):
             combined variables (B x 2C x H x W).
         """
         x = torch.cat((on, off), dim=1)
-        return self._upscale(x)
+        return F.conv_transpose2d(x, order_matrix, stride=2, padding=0)
 
     def g(self, z):
         """Transformation g: Z -> X (inverse of f).
@@ -843,24 +740,63 @@ class RealNVP(nn.Module):
         Returns:
             transformed tensor in data space X.
         """
-        # downscale and factor out the bottom half of the variables
-        x_on, x_off = self.factor_out(z)
+        x, x_off_1 = self.factor_out(z, self.order_matrix_1)
 
-        # SCALE 2: 16 x 16
-        for i in reversed(range(len(self.scale_2_ckbd))):
-            x_on, _ = self.scale_2_ckbd[i](x_on, reverse=True)
+        if self.datainfo.name in ['imnet32', 'imnet64', 'celeba']:
+            x, x_off_2 = self.factor_out(x, self.order_matrix_2)
+            x, x_off_3 = self.factor_out(x, self.order_matrix_3)
 
-        # restore the ordering and upscale
-        x = self.restore(x_on, x_off)
-        
-        # SCALE 1: 32 x 32
+            if self.datainfo.name in ['imnet64', 'celeba']:
+                x, x_off_4 = self.factor_out(x, self.order_matrix_4)
+
+                # SCALE 5: 4 x 4
+                for i in reversed(range(len(self.s5_ckbd))):
+                    x, _ = self.s5_ckbd[i](x, reverse=True)
+                
+                x = self.restore(x, x_off_4, self.order_matrix_4)
+
+                # SCALE 4: 8 x 8
+                x = self.squeeze(x)
+                for i in reversed(range(len(self.s4_chan))):
+                    x, _ = self.s4_chan[i](x, reverse=True)
+                x = self.undo_squeeze(x)
+
+            for i in reversed(range(len(self.s4_ckbd))):
+                x, _ = self.s4_ckbd[i](x, reverse=True)
+
+            x = self.restore(x, x_off_3, self.order_matrix_3)
+
+            # SCALE 3: 8(16) x 8(16)
+            x = self.squeeze(x)
+            for i in reversed(range(len(self.s3_chan))):
+                x, _ = self.s3_chan[i](x, reverse=True)
+            x = self.undo_squeeze(x)
+
+            for i in reversed(range(len(self.s3_ckbd))):
+                x, _ = self.s3_ckbd[i](x, reverse=True)
+
+            x = self.restore(x, x_off_2, self.order_matrix_2)
+
+            # SCALE 2: 16(32) x 16(32)
+            x = self.squeeze(x)
+            for i in reversed(range(len(self.s2_chan))):
+                x, _ = self.s2_chan[i](x, reverse=True)
+            x = self.undo_squeeze(x)
+
+        for i in reversed(range(len(self.s2_ckbd))):
+            x, _ = self.s2_ckbd[i](x, reverse=True)
+
+        x = self.restore(x, x_off_1, self.order_matrix_1)
+
+        # SCALE 1: 32(64) x 32(64)
         x = self.squeeze(x)
-        for i in reversed(range(len(self.scale_1_chan))):
-            x, _ = self.scale_1_chan[i](x, reverse=True)
+        for i in reversed(range(len(self.s1_chan))):
+            x, _ = self.s1_chan[i](x, reverse=True)
         x = self.undo_squeeze(x)
 
-        for i in reversed(range(len(self.scale_1_ckbd))):
-            x, _ = self.scale_1_ckbd[i](x, reverse=True)
+        for i in reversed(range(len(self.s1_ckbd))):
+            x, _ = self.s1_ckbd[i](x, reverse=True)
+
         return x
 
     def f(self, x):
@@ -872,30 +808,81 @@ class RealNVP(nn.Module):
             transformed tensor in latent space Z.
         """
         z, log_diag_J = x, torch.zeros_like(x)
-        
-        # SCALE 1: 32 x 32
-        for i in range(len(self.scale_1_ckbd)):
-            z, inc_log_diag_J = self.scale_1_ckbd[i](z)
-            log_diag_J = log_diag_J + inc_log_diag_J
+
+        # SCALE 1: 32(64) x 32(64)
+        for i in range(len(self.s1_ckbd)):
+            z, inc = self.s1_ckbd[i](z)
+            log_diag_J = log_diag_J + inc
 
         z, log_diag_J = self.squeeze(z), self.squeeze(log_diag_J)
-        for i in range(len(self.scale_1_chan)):
-            z, inc_log_diag_J = self.scale_1_chan[i](z)
-            log_diag_J = log_diag_J + inc_log_diag_J
+        for i in range(len(self.s1_chan)):
+            z, inc = self.s1_chan[i](z)
+            log_diag_J = log_diag_J + inc
         z, log_diag_J = self.undo_squeeze(z), self.undo_squeeze(log_diag_J)
 
-        # downscale and factor out the bottom half of the variables
-        z_on, z_off = self.factor_out(z)
-        log_diag_J_on, log_diag_J_off = self.factor_out(log_diag_J)
+        z, z_off_1 = self.factor_out(z, self.order_matrix_1)
+        log_diag_J, log_diag_J_off_1 = self.factor_out(log_diag_J, self.order_matrix_1)
 
-        # SCALE 2: 16 x 16
-        for i in range(len(self.scale_2_ckbd)):
-            z_on, inc_log_diag_J_on = self.scale_2_ckbd[i](z_on)
-            log_diag_J_on = log_diag_J_on + inc_log_diag_J_on
+        # SCALE 2: 16(32) x 16(32)
+        for i in range(len(self.s2_ckbd)):
+            z, inc = self.s2_ckbd[i](z)
+            log_diag_J = log_diag_J + inc
 
-        # restore the ordering and upscale
-        z = self.restore(z_on, z_off)
-        log_diag_J = self.restore(log_diag_J_on, log_diag_J_off)
+        if self.datainfo.name in ['imnet32', 'imnet64', 'celeba']:
+            z, log_diag_J = self.squeeze(z), self.squeeze(log_diag_J)
+            for i in range(len(self.s2_chan)):
+                z, inc = self.s2_chan[i](z)
+                log_diag_J = log_diag_J + inc
+            z, log_diag_J = self.undo_squeeze(z), self.undo_squeeze(log_diag_J)
+
+            z, z_off_2 = self.factor_out(z, self.order_matrix_2)
+            log_diag_J, log_diag_J_off_2 = self.factor_out(log_diag_J, self.order_matrix_2)
+
+            # SCALE 3: 8(16) x 8(16)
+            for i in range(len(self.s3_ckbd)):
+                z, inc = self.s3_ckbd[i](z)
+                log_diag_J = log_diag_J + inc
+
+            z, log_diag_J = self.squeeze(z), self.squeeze(log_diag_J)
+            for i in range(len(self.s3_chan)):
+                z, inc = self.s3_chan[i](z)
+                log_diag_J = log_diag_J + inc
+            z, log_diag_J = self.undo_squeeze(z), self.undo_squeeze(log_diag_J)
+
+            z, z_off_3 = self.factor_out(z, self.order_matrix_3)
+            log_diag_J, log_diag_J_off_3 = self.factor_out(log_diag_J, self.order_matrix_3)
+
+            # SCALE 4: 4(8) x 4(8)
+            for i in range(len(self.s4_ckbd)):
+                z, inc = self.s4_ckbd[i](z)
+                log_diag_J = log_diag_J + inc
+
+            if self.datainfo.name in ['imnet64', 'celeba']:
+                z, log_diag_J = self.squeeze(z), self.squeeze(log_diag_J)
+                for i in range(len(self.s4_chan)):
+                    z, inc = self.s4_chan[i](z)
+                    log_diag_J = log_diag_J + inc
+                z, log_diag_J = self.undo_squeeze(z), self.undo_squeeze(log_diag_J)
+
+                z, z_off_4 = self.factor_out(z, self.order_matrix_4)
+                log_diag_J, log_diag_J_off_4 = self.factor_out(log_diag_J, self.order_matrix_4)
+
+                # SCALE 5: 4 x 4
+                for i in range(len(self.s5_ckbd)):
+                    z, inc = self.s5_ckbd[i](z)
+                    log_diag_J = log_diag_J + inc
+
+                z = self.restore(z, z_off_4, self.order_matrix_4)
+                log_diag_J = self.restore(log_diag_J, log_diag_J_off_4, self.order_matrix_4)
+
+            z = self.restore(z, z_off_3, self.order_matrix_3)
+            z = self.restore(z, z_off_2, self.order_matrix_2)
+            log_diag_J = self.restore(log_diag_J, log_diag_J_off_3, self.order_matrix_3)
+            log_diag_J = self.restore(log_diag_J, log_diag_J_off_2, self.order_matrix_2)
+        
+        z = self.restore(z, z_off_1, self.order_matrix_1)
+        log_diag_J = self.restore(log_diag_J, log_diag_J_off_1, self.order_matrix_1)
+
         return z, log_diag_J
 
     def log_prob(self, x):
@@ -909,10 +896,9 @@ class RealNVP(nn.Module):
             log-likelihood of input.
         """
         z, log_diag_J = self.f(x)
-        [B, C, H, W] = list(z.size())
         log_det_J = torch.sum(log_diag_J, dim=(1, 2, 3))
         log_prior_prob = torch.sum(self.prior.log_prob(z), dim=(1, 2, 3))
-        return  log_prior_prob + log_det_J
+        return log_prior_prob + log_det_J
 
     def sample(self, size):
         """Generates samples.
@@ -922,8 +908,9 @@ class RealNVP(nn.Module):
         Returns:
             samples from the data space X.
         """
-        z = self.prior.sample((size, 3*32*32))
-        z = z.reshape((size, 3, 32, 32))
+        C = self.datainfo.channel
+        H = W = self.datainfo.size
+        z = self.prior.sample((size, C, H, W))
         return self.g(z)
 
     def forward(self, x):
@@ -934,12 +921,56 @@ class RealNVP(nn.Module):
         Returns:
             log-likelihood of input.
         """
-        return self.log_prob(x)
+        weight_scale = None
+        for name, param in self.named_parameters():
+            param_name = name.split('.')[-1]
+            if param_name in ['weight_g', 'scale'] and param.requires_grad:
+                if weight_scale is None:
+                    weight_scale = torch.pow(param, 2).sum()
+                else:
+                    weight_scale = weight_scale + torch.pow(param, 2).sum()
+        return self.log_prob(x), weight_scale
+
+class DataInfo():
+    def __init__(self, name, channel, size):
+        """Instantiates a DataInfo.
+
+        Args:
+            name: name of the dataset.
+            channel: number of image channels.
+            size: height and width of an image.
+        """
+        self.name = name
+        self.channel = channel
+        self.size = size
+
+class Hyperparameters():
+    def __init__(self, base_dim, res_blocks, bottleneck, 
+        skip, weight_norm, coupling_bn, affine):
+        """Instantiates a set of hyperparameters.
+
+        Args:
+            base_dim: features in residual blocks of first few layers.
+            res_blocks: number of residual blocks to use.
+            bottleneck: True if use bottleneck, False otherwise.
+            skip: True if use skip architecture, False otherwise.
+            weight_norm: True if apply weight normalization, False otherwise.
+            coupling_bn: True if batchnorm coupling layer output, False otherwise.
+            affine: True if use affine coupling, False if use additive coupling.
+        """
+        self.base_dim = base_dim
+        self.res_blocks = res_blocks
+        self.bottleneck = bottleneck
+        self.skip = skip
+        self.weight_norm = weight_norm
+        self.coupling_bn = coupling_bn
+        self.affine = affine
 
 def logit_transform(x, constraint=0.9, reverse=False):
-    '''Transform data from [0, 1] into unbounded space.
+    '''Transforms data from [0, 1] into unbounded space.
 
-    First restrict data into [0.05, 0.95]. Then do logit(alpha+(1-alpha)*x).
+    Restricts data into [0.05, 0.95].
+    Calculates logit(alpha+(1-alpha)*x).
 
     Args:
         x: input tensor.
@@ -950,7 +981,7 @@ def logit_transform(x, constraint=0.9, reverse=False):
         (if reverse=True, no log-determinant is returned.)
     '''
     if reverse:
-        x = 1. / (torch.exp(-x) + 1)    # [0.05, 0.95]
+        x = 1. / (torch.exp(-x) + 1.)    # [0.05, 0.95]
         x *= 2.             # [0.1, 1.9]
         x -= 1.             # [-0.9, 0.9]
         x /= constraint     # [-1, 1]
@@ -961,8 +992,8 @@ def logit_transform(x, constraint=0.9, reverse=False):
         [B, C, H, W] = list(x.size())
         
         # dequantization
-        noise = distributions.Uniform(0, 1).sample((B*C*H*W, ))
-        x = (x * 255. + noise.reshape((B, C, H, W))) / 256.
+        noise = distributions.Uniform(0., 1.).sample((B, C, H, W))
+        x = (x * 255. + noise) / 256.
         
         # restrict the data
         x *= 2.             # [0, 2]
@@ -985,69 +1016,90 @@ def main(args):
     device = torch.device("cuda:0")
 
     # model hyperparameters
+    dataset = args.dataset
     batch_size = args.batch_size
     latent = args.latent
-    base_dim = args.base_dim
-    res_blocks = args.res_blocks
-    mask_config = args.mask_config
-    bottleneck = args.bottleneck
-    down_factor = args.down_factor
-    scale_reg = args.scale_reg
-    skip = args.skip
-    weight_norm = args.weight_norm
-    coupling_bn = args.coupling_bn
-    affine = args.affine
+    hps = Hyperparameters(
+        base_dim = args.base_dim, 
+        res_blocks = args.res_blocks, 
+        bottleneck = args.bottleneck, 
+        skip = args.skip, 
+        weight_norm = args.weight_norm, 
+        coupling_bn = args.coupling_bn, 
+        affine = args.affine)
+    scale_reg = 5e-5
 
     filename = 'bs%d_' % batch_size \
-             + 'bd%d_' % base_dim \
-             + 'rb%d_' % res_blocks \
-             + 'bn%d_' % bottleneck \
-             + 'sr%d_' % scale_reg \
-             + 'sk%d_' % skip \
-             + 'wn%d_' % weight_norm \
-             + 'cb%d_' % coupling_bn \
-             + 'af%d_' % affine
+             + '%s_' % latent \
+             + 'bd%d_' % hps.base_dim \
+             + 'rb%d_' % hps.res_blocks \
+             + 'bn%d_' % hps.bottleneck \
+             + 'sk%d_' % hps.skip \
+             + 'wn%d_' % hps.weight_norm \
+             + 'cb%d_' % hps.coupling_bn \
+             + 'af%d' % hps.affine \
 
     # optimization hyperparameters
     lr = args.lr
     momentum = args.momentum
     decay = args.decay
 
-    transform = transforms.Compose(
-        [transforms.RandomHorizontalFlip(p=0.5),
-         transforms.ToTensor()])
-
-    trainset = torchvision.datasets.CIFAR10(root='~/torch/data',
-        train=True, download=True, transform=transform)
+    if dataset == 'cifar10':    # 3 x 32 x 32
+        datainfo = DataInfo(dataset, 3, 32)
+        transform = transforms.Compose(
+            [transforms.RandomHorizontalFlip(p=0.5), 
+             transforms.ToTensor()])
+        trainset = datasets.CIFAR10('../../data/CIFAR10', 
+            train=True, download=True, transform=transform)
+    elif dataset == 'celeba':   # 3 x 218 x 178
+        datainfo = DataInfo(dataset, 3, 64)
+        def CelebACrop(images):
+            return transforms.functional.crop(images, 40, 15, 148, 148)
+        transform = transforms.Compose(
+            [CelebACrop, 
+             transforms.Resize(64), 
+             transforms.RandomHorizontalFlip(p=0.5), 
+             transforms.ToTensor()])
+        trainset = datasets.ImageFolder('../../data/CelebA/train', 
+            transform=transform)
+    elif dataset == 'imnet32':
+        datainfo = DataInfo(dataset, 3, 32)
+        transform = transforms.Compose(
+            [transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor()])
+        trainset = datasets.ImageFolder('../../data/ImageNet32/train', 
+            transform=transform)
+    elif dataset == 'imnet64':
+        datainfo = DataInfo(dataset, 3, 64)
+        transform = transforms.Compose(
+            [transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor()])
+        trainset = datasets.ImageFolder('../../data/ImageNet64/train', 
+            transform=transform)
+    
     trainloader = torch.utils.data.DataLoader(trainset,
         batch_size=batch_size, shuffle=True, num_workers=2)
 
-    image_size = 32
-    full_dim = 3 * image_size**2
-
-    if latent == 'normal':
-        prior = distributions.Normal(0., 1.)
-    elif latent == 'logistic':
-        base = distributions.Uniform(0., 1.)
-        transforms = [distributions.SigmoidTransform().inv, 
-                      distributions.AffineTransform(loc=0., scale=1.)]
-        prior = distributions.TransformedDistribution(base, transforms)
-
-    flow = RealNVP(prior=prior, 
-                   base_dim=base_dim, 
-                   res_blocks=res_blocks, 
-                   mask_config=mask_config, 
-                   bottleneck=bottleneck, 
-                   down_factor=down_factor, 
-                   skip=skip, 
-                   weight_norm=weight_norm, 
-                   coupling_bn=coupling_bn, 
-                   affine=affine).to(device)
+    prior = distributions.Normal(   # isotropic standard normal distribution
+        torch.tensor(0.).to(device), torch.tensor(1.).to(device))
+    flow = RealNVP(datainfo=datainfo, prior=prior, hps=hps).to(device)
     optimizer = optim.Adam(flow.parameters(), lr=lr, betas=(momentum, decay))
-
     total_iter = 0
+
+    # load existing checkpoint
+    try:
+        ckpt = torch.load('./models/' + dataset + '/' + filename + '.tar')
+        flow.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        total_iter = ckpt['total_iter']
+        print('Load checkpoint: success!')
+        print('starting iter: %d loss: %.3f' % (total_iter, ckpt['loss']))
+    except:
+        print('Train from scratch.')
+
     train = True
     running_loss = 0
+    image_size = datainfo.channel * datainfo.size**2
 
     while train:
         for _, data in enumerate(trainloader, 1):
@@ -1066,30 +1118,21 @@ def main(args):
             log_det_J = log_det_J.to(device)
 
             # log-likelihood of input minibatch
-            # (log-determinant of Jacobian from logit transform NOT included)
-            log_ll = flow(inputs)
-            loss = -(log_ll + log_det_J).mean()
+            log_ll, weight_scale = flow(inputs)
+            log_ll = (log_ll + log_det_J).mean()
 
-            # L2 regularization on the weight scale parameters
-            if weight_norm:
-                weight_scale = 0
-                for name, param in flow.named_parameters():
-                    tokens = name.split('.')
-                    param_name = tokens[-1]
-                    if param_name in ['weight_g', 'scale'] and param.requires_grad:
-                        weight_scale = weight_scale + torch.sum(param.data**2)
-                loss = loss + scale_reg * weight_scale
-
+            # add L2 regularization on scaling factors
+            loss = -log_ll + scale_reg * weight_scale
             running_loss += float(loss)
 
             # backprop and update parameters
             loss.backward()
             optimizer.step()
 
-            if total_iter % 2000 == 0:
-                mean_loss = running_loss / 2000
-                bit_per_dim = (mean_loss + np.log(256.) * full_dim) \
-                            / (full_dim * np.log(2.))
+            if total_iter % 500 == 0:
+                mean_loss = running_loss / 500
+                bit_per_dim = (float(-log_ll) + np.log(256.) * image_size) \
+                            / (image_size * np.log(2.))
                 print('iter %s:' % total_iter, 
                     'loss = %.3f' % mean_loss, 
                     'bits/dim = %.3f' % bit_per_dim)
@@ -1103,39 +1146,41 @@ def main(args):
                     samples = flow.sample(args.sample_size)
                     samples, _ = logit_transform(samples, reverse=True)
                     utils.save_image(utils.make_grid(reconst),
-                        './reconstruction/' + filename +'iter%d.png' % total_iter)
+                        './reconstruction/' + dataset + '/' + filename + '_%d.png' % total_iter)
                     utils.save_image(utils.make_grid(samples),
-                        './samples/' + filename +'iter%d.png' % total_iter)
+                        './samples/' + dataset + '/' + filename + '_%d.png' % total_iter)
+
+                if total_iter % 20000 == 0:
+                    torch.save({
+                        'total_iter': total_iter,
+                        'loss': mean_loss, 
+                        'model_state_dict': flow.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'batch_size': batch_size,
+                        'base_dim': hps.base_dim,
+                        'res_blocks': hps.res_blocks,
+                        'bottleneck': hps.bottleneck,
+                        'skip': hps.skip,
+                        'weight_norm': hps.weight_norm,
+                        'coupling_bn': hps.coupling_bn,
+                        'affine': hps.affine}, 
+                        './models/' + dataset + '/' + filename + '.tar')
+                    print('Checkpoint Saved')
 
     print('Finished training!')
 
-    torch.save({
-        'total_iter': total_iter,
-        'model_state_dict': flow.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'batch_size': batch_size,
-        'base_dim': base_dim,
-        'res_blocks': res_blocks,
-        'mask_config': mask_config,
-        'bottleneck': bottleneck,
-        'down_factor': down_factor,
-        'scale_reg': scale_reg,
-        'skip': skip,
-        'weight_norm': weight_norm,
-        'coupling_bn': coupling_bn,
-        'affine': affine}, 
-        './models/realNVP/cifar10/' + filename +'iter%d.tar' % total_iter)
-
-    print('Checkpoint Saved')
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('CIFAR-10 realNVP PyTorch implementation')
+    parser.add_argument('--dataset',
+                        help='dataset to be modeled.',
+                        type=str,
+                        default='cifar10')
     parser.add_argument('--batch_size',
-                        help='number of images in a mini-batch',
+                        help='number of images in a mini-batch.',
                         type=int,
                         default=64)
     parser.add_argument('--latent',
-                        help='latent distribution',
+                        help='latent distribution.',
                         type=str,
                         default='normal')
     parser.add_argument('--base_dim',
@@ -1143,59 +1188,47 @@ if __name__ == '__main__':
                         type=int,
                         default=64)
     parser.add_argument('--res_blocks',
-                        help='number of residual blocks per group',
+                        help='number of residual blocks per group.',
                         type=int,
                         default=8)
-    parser.add_argument('--mask_config',
-                        help='mask configuration',
-                        type=float,
-                        default=1.)
     parser.add_argument('--bottleneck',
-                        help='whether to use bottleneck in residual blocks',
+                        help='whether to use bottleneck in residual blocks.',
                         type=int,
                         default=0)
-    parser.add_argument('--down_factor',
-                        help='by how much to reduce features in bottleneck',
-                        type=int,
-                        default=1)
-    parser.add_argument('--scale_reg',
-                        help='L2 regularization on weight scale parameters',
-                        type=float,
-                        default=5*1e-5)
     parser.add_argument('--skip',
-                        help='whether to use skip connection in coupling layers',
+                        help='whether to use skip connection in coupling layers.',
                         type=int,
                         default=1)
     parser.add_argument('--weight_norm',
-                        help='whether to apply weight normalization',
+                        help='whether to apply weight normalization.',
                         type=int,
                         default=1)
     parser.add_argument('--coupling_bn',
-                        help='whether to apply batchnorm after coupling layers',
+                        help='whether to apply batchnorm after coupling layers.',
                         type=int,
                         default=1)
     parser.add_argument('--affine',
-                        help='whether to use affine coupling',
+                        help='whether to use affine coupling.',
                         type=int,
                         default=1)
     parser.add_argument('--max_iter',
-                        help='maximum number of iterations',
+                        help='maximum number of iterations.',
                         type=int,
                         default=250000)
     parser.add_argument('--sample_size',
-                        help='number of images to generate',
+                        help='number of images to generate.',
                         type=int,
                         default=64)
     parser.add_argument('--lr',
-                        help='initial learning rate',
+                        help='initial learning rate.',
                         type=float,
                         default=1e-3)
     parser.add_argument('--momentum',
-                        help='beta1 in Adam optimizer',
+                        help='beta1 in Adam optimizer.',
                         type=float,
                         default=0.9)
     parser.add_argument('--decay',
-                        help='beta2 in Adam optimizer',
+                        help='beta2 in Adam optimizer.',
                         type=float,
                         default=0.999)
     args = parser.parse_args()
