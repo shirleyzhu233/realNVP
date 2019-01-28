@@ -55,6 +55,7 @@ def main(args):
 
     # prefix for images and checkpoints
     filename = 'bs%d_' % batch_size \
+             + 'normal_' \
              + 'bd%d_' % hps.base_dim \
              + 'rb%d_' % hps.res_blocks \
              + 'bn%d_' % hps.bottleneck \
@@ -76,7 +77,9 @@ def main(args):
 
     # load model checkpoint
     try:
-        ckpt = torch.load('./models/' + dataset + '/' + filename + '.tar')
+        path = 'models/' + dataset + '/' + filename + '.tar'
+        print(path)
+        ckpt = torch.load(path)
         flow.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         total_iter = ckpt['total_iter']
@@ -197,7 +200,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_iter',
                         help='maximum number of iterations.',
                         type=int,
-                        default=250000)
+                        default=100000)
     parser.add_argument('--sample_size',
                         help='number of images to generate.',
                         type=int,
