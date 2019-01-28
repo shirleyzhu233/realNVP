@@ -78,7 +78,6 @@ def main(args):
     # load model checkpoint
     try:
         path = 'models/' + dataset + '/' + filename + '.tar'
-        print(path)
         ckpt = torch.load(path)
         flow.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
