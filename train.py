@@ -93,7 +93,7 @@ def main(args):
 
     while train:
         for _, data in enumerate(trainloader, 1):
-            flow.train()    # set to training mode
+            flow.train()
             if total_iter == args.max_iter:
                 train = False
                 break
