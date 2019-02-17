@@ -66,9 +66,7 @@ def main(args):
              + 'af%d' % hps.affine \
 
     # load dataset
-    train_set, datainfo = data_utils.load(dataset)
-    [train_split, val_split] = torch.utils.data.random_split(train_set, [45000, 5000])
-    
+    train_split, val_split, data_info = data_utils.load(dataset)
     train_loader = torch.utils.data.DataLoader(train_split,
         batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = torch.utils.data.DataLoader(val_split,
@@ -76,8 +74,7 @@ def main(args):
 
     prior = distributions.Normal(   # isotropic standard normal distribution
         torch.tensor(0.).to(device), torch.tensor(1.).to(device))
-    flow = realnvp.RealNVP(datainfo=datainfo, prior=prior, hps=hps).to(device)
-    # optimizer = optim.Adam(flow.parameters(), lr=lr, betas=(momentum, decay))
+    flow = realnvp.RealNVP(datainfo=data_info, prior=prior, hps=hps).to(device)
     optimizer = optim.Adamax(flow.parameters(), lr=lr, betas=(momentum, decay), eps=1e-7)
     
     epoch = 0
@@ -86,7 +83,7 @@ def main(args):
     optimal_log_ll = float('-inf')
     early_stop = 0
 
-    image_size = datainfo.channel * datainfo.size**2    # full image dimension
+    image_size = data_info.channel * data_info.size**2    # full image dimension
 
     while epoch < args.max_epoch:
         epoch += 1
@@ -116,8 +113,8 @@ def main(args):
                 bit_per_dim = (-log_ll.item() + np.log(256.) * image_size) \
                     / (image_size * np.log(2.))
                 print('[%d/%d]\tloss: %.3f\tlog-ll: %.3f\tbits/dim: %.3f' % \
-                    (batch_idx*batch_size, 45000, loss.item(), log_ll.item(), 
-                        bit_per_dim))
+                    (batch_idx*batch_size, len(train_loader.dataset), 
+                        loss.item(), log_ll.item(), bit_per_dim))
         
         mean_loss = running_loss / batch_idx
         mean_log_ll = running_log_ll / batch_idx

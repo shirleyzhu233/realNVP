@@ -4,6 +4,7 @@
 import torch
 import torch.nn.functional as F
 import torch.distributions as distributions
+import torch.utils.data as data
 
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
@@ -31,14 +32,16 @@ def load(dataset):
         a torch dataset and its associated information.
     """
     if dataset == 'cifar10':    # 3 x 32 x 32
-        datainfo = DataInfo(dataset, 3, 32)
+        data_info = DataInfo(dataset, 3, 32)
         transform = transforms.Compose(
             [transforms.RandomHorizontalFlip(p=0.5), 
              transforms.ToTensor()])
-        trainset = datasets.CIFAR10('../../data/CIFAR10', 
+        train_set = datasets.CIFAR10('../../data/CIFAR10', 
             train=True, download=True, transform=transform)
+        [train_split, val_split] = data.random_split(train_set, [46000, 4000])
+
     elif dataset == 'celeba':   # 3 x 218 x 178
-        datainfo = DataInfo(dataset, 3, 64)
+        data_info = DataInfo(dataset, 3, 64)
         def CelebACrop(images):
             return transforms.functional.crop(images, 40, 15, 148, 148)
         transform = transforms.Compose(
@@ -46,24 +49,29 @@ def load(dataset):
              transforms.Resize(64), 
              transforms.RandomHorizontalFlip(p=0.5), 
              transforms.ToTensor()])
-        trainset = datasets.ImageFolder('../../data/CelebA/train', 
+        train_set = datasets.ImageFolder('../../data/CelebA/train', 
             transform=transform)
-    elif dataset == 'imnet32':
-        datainfo = DataInfo(dataset, 3, 32)
-        transform = transforms.Compose(
-            [transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor()])
-        trainset = datasets.ImageFolder('../../data/ImageNet32/train', 
-            transform=transform)
-    elif dataset == 'imnet64':
-        datainfo = DataInfo(dataset, 3, 64)
-        transform = transforms.Compose(
-            [transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor()])
-        trainset = datasets.ImageFolder('../../data/ImageNet64/train', 
-            transform=transform)
+        [train_split, val_split] = data.random_split(train_set, [150000, 12770])
 
-    return trainset, datainfo
+    elif dataset == 'imnet32':
+        data_info = DataInfo(dataset, 3, 32)
+        transform = transforms.Compose(
+            [transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor()])
+        train_set = datasets.ImageFolder('../../data/ImageNet32/train', 
+            transform=transform)
+        [train_split, val_split] = data.random_split(train_set, [1250000, 31149])
+
+    elif dataset == 'imnet64':
+        data_info = DataInfo(dataset, 3, 64)
+        transform = transforms.Compose(
+            [transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor()])
+        train_set = datasets.ImageFolder('../../data/ImageNet64/train', 
+            transform=transform)
+        [train_split, val_split] = data.random_split(train_set, [1250000, 31149])
+
+    return train_split, val_split, data_info
 
 def logit_transform(x, constraint=0.9, reverse=False):
     '''Transforms data from [0, 1] into unbounded space.
