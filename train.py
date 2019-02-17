@@ -6,8 +6,9 @@ import argparse
 import torch, torchvision
 import torch.distributions as distributions
 import torch.optim as optim
-import numpy as np
+import torchvision.utils as utils
 
+import numpy as np
 import realnvp, data_utils
 
 class Hyperparameters():
@@ -65,101 +66,118 @@ def main(args):
              + 'af%d' % hps.affine \
 
     # load dataset
-    trainset, datainfo = data_utils.load(dataset)
-    trainloader = torch.utils.data.DataLoader(trainset,
+    train_set, datainfo = data_utils.load(dataset)
+    [train_split, val_split] = torch.utils.data.random_split(train_set, [45000, 5000])
+    
+    train_loader = torch.utils.data.DataLoader(train_split,
         batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = torch.utils.data.DataLoader(val_split,
+        batch_size=batch_size, shuffle=False, num_workers=2)
 
     prior = distributions.Normal(   # isotropic standard normal distribution
         torch.tensor(0.).to(device), torch.tensor(1.).to(device))
     flow = realnvp.RealNVP(datainfo=datainfo, prior=prior, hps=hps).to(device)
-    optimizer = optim.Adam(flow.parameters(), lr=lr, betas=(momentum, decay))
-    total_iter = 0
+    # optimizer = optim.Adam(flow.parameters(), lr=lr, betas=(momentum, decay))
+    optimizer = optim.Adamax(flow.parameters(), lr=lr, betas=(momentum, decay), eps=1e-7)
+    
+    epoch = 0
+    running_loss = 0.
+    running_log_ll = 0.
+    optimal_log_ll = float('-inf')
+    early_stop = 0
 
-    # load model checkpoint
-    try:
-        path = 'models/' + dataset + '/' + filename + '.tar'
-        ckpt = torch.load(path)
-        flow.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        total_iter = ckpt['total_iter']
-        print('Load checkpoint: success!')
-        print('\tstart from iter: %d loss: %.3f' % (total_iter, ckpt['loss']))
-    except:
-        print('No checkpoint found. Train from scratch.')
-
-    train = True
-    running_loss = 0
     image_size = datainfo.channel * datainfo.size**2    # full image dimension
 
-    while train:
-        for _, data in enumerate(trainloader, 1):
-            flow.train()
-            if total_iter == args.max_iter:
-                train = False
-                break
-
-            total_iter += 1
+    while epoch < args.max_epoch:
+        epoch += 1
+        print('Epoch %d:' % epoch)
+        flow.train()
+        for batch_idx, data in enumerate(train_loader, 1):
             optimizer.zero_grad()
-
-            inputs, _ = data
+            x, _ = data
             # log-determinant of Jacobian from the logit transform
-            inputs, log_det_J = data_utils.logit_transform(inputs)
-            inputs = inputs.to(device)
-            log_det_J = log_det_J.to(device)
+            x, log_det = data_utils.logit_transform(x)
+            x = x.to(device)
+            log_det = log_det.to(device)
 
             # log-likelihood of input minibatch
-            log_ll, weight_scale = flow(inputs)
-            log_ll = (log_ll + log_det_J).mean()
+            log_ll, weight_scale = flow(x)
+            log_ll = (log_ll + log_det).mean()
 
             # add L2 regularization on scaling factors
             loss = -log_ll + scale_reg * weight_scale
-            running_loss += float(loss)
+            running_loss += loss.item()
+            running_log_ll += log_ll.item()
 
             loss.backward()
             optimizer.step()
 
-            if total_iter % 500 == 0:
-                mean_loss = running_loss / 500
-                bit_per_dim = (float(-log_ll) + np.log(256.) * image_size) \
-                            / (image_size * np.log(2.))
-                print('iter %s:' % total_iter, 
-                      'loss = %.3f' % mean_loss, 
-                      'bits/dim = %.3f' % bit_per_dim)
-                running_loss = 0.
+            if batch_idx % 10 == 0:
+                bit_per_dim = (-log_ll.item() + np.log(256.) * image_size) \
+                    / (image_size * np.log(2.))
+                print('[%d/%d]\tloss: %.3f\tlog-ll: %.3f\tbits/dim: %.3f' % \
+                    (batch_idx*batch_size, 45000, loss.item(), log_ll.item(), 
+                        bit_per_dim))
+        
+        mean_loss = running_loss / batch_idx
+        mean_log_ll = running_log_ll / batch_idx
+        mean_bit_per_dim = (-mean_log_ll + np.log(256.) * image_size) \
+             / (image_size * np.log(2.))
+        print('===> Average train loss: %.3f' % mean_loss)
+        print('===> Average train log-likelihood: %.3f' % mean_log_ll)
+        print('===> Average train bit_per_dim: %.3f' % mean_bit_per_dim)
+        running_loss = 0.
+        running_log_ll = 0.
 
-                flow.eval()
-                with torch.no_grad():
-                    z, _ = flow.f(inputs)
-                    reconst = flow.g(z)
-                    reconst, _ = data_utils.logit_transform(reconst, reverse=True)
-                    samples = flow.sample(args.sample_size)
-                    samples, _ = data_utils.logit_transform(samples, reverse=True)
-                    torchvision.utils.save_image(utils.make_grid(reconst),
-                        './reconstruction/' + dataset + '/' + filename + '_%d.png' % total_iter)
-                    torchvision.utils.save_image(utils.make_grid(samples),
-                        './samples/' + dataset + '/' + filename + '_%d.png' % total_iter)
+        flow.eval()
+        with torch.no_grad():
+            for batch_idx, data in enumerate(val_loader, 1):
+                x, _ = data
+                x, log_det = data_utils.logit_transform(x)
+                x = x.to(device)
+                log_det = log_det.to(device)
 
-                if total_iter % 20000 == 0:
-                    torch.save({
-                        'total_iter': total_iter,
-                        'loss': mean_loss, 
-                        'model_state_dict': flow.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'batch_size': batch_size,
-                        'base_dim': hps.base_dim,
-                        'res_blocks': hps.res_blocks,
-                        'bottleneck': hps.bottleneck,
-                        'skip': hps.skip,
-                        'weight_norm': hps.weight_norm,
-                        'coupling_bn': hps.coupling_bn,
-                        'affine': hps.affine}, 
-                        './models/' + dataset + '/' + filename + '.tar')
-                    print('Checkpoint saved.')
+                # log-likelihood of input minibatch
+                log_ll, weight_scale = flow(x)
+                log_ll = (log_ll + log_det).mean()
 
-    print('Training finished.')
+                # add L2 regularization on scaling factors
+                loss = -log_ll + scale_reg * weight_scale
+                running_loss += loss.item()
+                running_log_ll += log_ll.item()
+
+            mean_loss = running_loss / batch_idx
+            mean_log_ll = running_log_ll / batch_idx
+            mean_bit_per_dim = (-mean_log_ll + np.log(256.) * image_size) \
+                / (image_size * np.log(2.))
+            print('===> Average validation loss: %.3f' % mean_loss)
+            print('===> Average validation log-likelihood: %.3f' % mean_log_ll)
+            print('===> Average validation bits/dim: %.3f' % mean_bit_per_dim)
+            running_loss = 0.
+            running_log_ll = 0.
+
+            samples = flow.sample(args.sample_size)
+            samples, _ = data_utils.logit_transform(samples, reverse=True)
+            utils.save_image(utils.make_grid(samples),
+                './samples/' + dataset + '/' + filename + '_ep%d.png' % epoch)
+
+        if mean_log_ll > optimal_log_ll:
+            early_stop = 0
+            optimal_log_ll = mean_log_ll
+            torch.save(flow, './models/' + dataset + '/' + filename + '.model')
+            print('[MODEL SAVED]')
+        else:
+            early_stop += 1
+            if early_stop >= 100:
+                break
+        
+        print('--> Early stopping %d/100 (BEST validation log-likelihood: %.3f)' \
+            % (early_stop, optimal_log_ll))
+
+    print('Training finished at epoch %d.' % epoch)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('CIFAR-10 realNVP PyTorch implementation')
+    parser = argparse.ArgumentParser('Real NVP PyTorch implementation')
     parser.add_argument('--dataset',
                         help='dataset to be modeled.',
                         type=str,
@@ -196,10 +214,10 @@ if __name__ == '__main__':
                         help='whether to use affine coupling.',
                         type=int,
                         default=1)
-    parser.add_argument('--max_iter',
-                        help='maximum number of iterations.',
+    parser.add_argument('--max_epoch',
+                        help='maximum number of training epoches.',
                         type=int,
-                        default=100000)
+                        default=500)
     parser.add_argument('--sample_size',
                         help='number of images to generate.',
                         type=int,
